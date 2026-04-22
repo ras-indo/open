@@ -248,24 +248,64 @@ class SQLiteSessionStore:
                 )
                 """
             )
+            self._ensure_schema(c)
+
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if not cols:
+            return
+        if "k" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN k TEXT")
+        if "payload" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN payload TEXT")
+        if "expire_at" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN expire_at REAL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expire_at ON sessions(expire_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_k ON sessions(k)")
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
-        with self._lock, self._conn() as c:
-            now = time.time()
-            c.execute("DELETE FROM sessions WHERE expire_at < ?", (now,))
-            row = c.execute("SELECT payload FROM sessions WHERE k = ?", (key,)).fetchone()
-            if not row:
+        with self._lock:
+            try:
+                with self._conn() as c:
+                    self._ensure_schema(c)
+                    now = time.time()
+                    c.execute("DELETE FROM sessions WHERE expire_at IS NOT NULL AND expire_at < ?", (now,))
+                    row = c.execute("SELECT payload FROM sessions WHERE k = ? LIMIT 1", (key,)).fetchone()
+                    if row and row[0]:
+                        c.execute("UPDATE sessions SET expire_at = ? WHERE k = ?", (now + self.ttl, key))
+                        return json.loads(row[0])
+
+                    # backward-compatible fallback for legacy schema variants
+                    cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)").fetchall()}
+                    if "data" in cols:
+                        row = c.execute("SELECT data FROM sessions WHERE k = ? LIMIT 1", (key,)).fetchone()
+                        if row and row[0]:
+                            c.execute(
+                                "UPDATE sessions SET payload = ?, expire_at = ? WHERE k = ?",
+                                (row[0], now + self.ttl, key),
+                            )
+                            return json.loads(row[0])
+                    return None
+            except sqlite3.Error as exc:
+                L_CTX.warning("SQLite get failed, returning empty session. err=%s", exc)
                 return None
-            c.execute("UPDATE sessions SET expire_at = ? WHERE k = ?", (now + self.ttl, key))
-            return json.loads(row[0])
 
     def set(self, key: str, payload: Dict[str, Any]) -> None:
-        with self._lock, self._conn() as c:
-            c.execute(
-                "INSERT INTO sessions(k, payload, expire_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(k) DO UPDATE SET payload = excluded.payload, expire_at = excluded.expire_at",
-                (key, json.dumps(payload, ensure_ascii=False), time.time() + self.ttl),
-            )
+        with self._lock:
+            try:
+                with self._conn() as c:
+                    self._ensure_schema(c)
+                    c.execute(
+                        "UPDATE sessions SET payload = ?, expire_at = ? WHERE k = ?",
+                        (json.dumps(payload, ensure_ascii=False), time.time() + self.ttl, key),
+                    )
+                    if c.total_changes == 0:
+                        c.execute(
+                            "INSERT INTO sessions(k, payload, expire_at) VALUES(?, ?, ?)",
+                            (key, json.dumps(payload, ensure_ascii=False), time.time() + self.ttl),
+                        )
+            except sqlite3.Error as exc:
+                L_CTX.warning("SQLite set failed, skipping persist. err=%s", exc)
 
 
 SESSION = SQLiteSessionStore(SQLITE_PATH, SESSION_TTL_SECONDS) if SESSION_BACKEND == "sqlite" else InMemorySessionStore(SESSION_TTL_SECONDS)
