@@ -381,6 +381,19 @@ def _flatten_content_to_markdown(content: Union[str, List[Dict[str, Any]], None]
             iu = part.get("image_url", {})
             if isinstance(iu, dict) and iu.get("url"):
                 parts.append(f"![image]({iu['url']})")
+        elif t == "input_audio":
+            audio = part.get("input_audio", {})
+            fmt = audio.get("format", "unknown") if isinstance(audio, dict) else "unknown"
+            parts.append(f"[audio:{fmt}]")
+        elif t in {"file", "input_file"}:
+            file_obj = part.get("file", {}) if t == "file" else part.get("input_file", {})
+            if isinstance(file_obj, dict):
+                fid = file_obj.get("file_id") or file_obj.get("filename") or "unknown"
+                parts.append(f"[file:{fid}]")
+            else:
+                parts.append("[file]")
+        else:
+            parts.append(f"[{t}:{json.dumps(part, ensure_ascii=False)[:240]}]")
     return "\n\n".join(p for p in parts if p)
 
 
@@ -416,6 +429,46 @@ class UpstreamError(Exception):
 
 
 _HTTP: Optional[httpx.AsyncClient] = None
+
+
+class ToolCallRelay:
+    """Accumulate fragmented tool_calls deltas into OpenAI-compatible chunks."""
+
+    def __init__(self) -> None:
+        self._acc: Dict[int, Dict[str, Any]] = {}
+        self._first: set[int] = set()
+
+    def push(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        idx = int(raw.get("index", 0))
+        cur = self._acc.setdefault(
+            idx,
+            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+        )
+        if raw.get("id"):
+            cur["id"] = raw["id"]
+        if raw.get("type"):
+            cur["type"] = raw["type"]
+        fn = raw.get("function") or {}
+        if fn.get("name"):
+            cur["function"]["name"] += fn["name"]
+        if fn.get("arguments"):
+            cur["function"]["arguments"] += fn["arguments"]
+
+        first = idx not in self._first
+        if first:
+            self._first.add(idx)
+            return {
+                "index": idx,
+                "id": cur["id"] or f"call_{uuid.uuid4().hex[:24]}",
+                "type": cur["type"],
+                "function": {
+                    "name": cur["function"]["name"],
+                    "arguments": fn.get("arguments") or "",
+                },
+            }
+        if fn.get("arguments"):
+            return {"index": idx, "function": {"arguments": fn["arguments"]}}
+        return None
 
 
 async def _http() -> httpx.AsyncClient:
@@ -466,13 +519,39 @@ async def _call_sync(payload: Dict[str, Any], rid: str, phase: str, allow_text_f
     except Exception:
         raise HTTPException(502, detail="Upstream non-JSON response")
 
-    if not isinstance(data, dict) or "choices" not in data:
+    if not isinstance(data, dict):
         if allow_text_fallback:
             L_HTTP.warning("Fallback malformed-response rid=%s phase=%s", rid, phase)
             return await _call_sync(_normalize_payload_to_text(payload), rid, f"{phase}:shape", False)
         raise HTTPException(502, detail="Upstream malformed completion response")
 
+    if "choices" not in data:
+        if allow_text_fallback:
+            L_HTTP.warning("Fallback malformed-response rid=%s phase=%s", rid, phase)
+            return await _call_sync(_normalize_payload_to_text(payload), rid, f"{phase}:shape", False)
+        L_HTTP.warning("Upstream non-standard completion shape rid=%s phase=%s; normalizing downstream", rid, phase)
+
     return data
+
+
+def _normalize_sync_completion_shape(data: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Best-effort shape normalization for unstable upstreams."""
+    if "choices" in data and isinstance(data["choices"], list):
+        return data
+    if isinstance(data.get("response"), str):
+        text = data["response"]
+    elif isinstance(data.get("output_text"), str):
+        text = data["output_text"]
+    else:
+        text = json.dumps(data, ensure_ascii=False)[:4000]
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": data.get("usage", {}),
+    }
 
 
 async def _call_stream(payload: Dict[str, Any], rid: str, phase: str, allow_text_fallback: bool = True) -> AsyncGenerator[Dict[str, Any], None]:
@@ -682,6 +761,19 @@ async def handle_sync(req: ChatCompletionRequest, rid: str, cid: str, client: st
 
     payload = _build_passthrough_payload(req, messages=messages, stream=False)
     data = await _call_sync(payload, rid, "act")
+    data = _normalize_sync_completion_shape(data, req.model)
+    if reasoning:
+        try:
+            choice0 = (data.get("choices") or [{}])[0]
+            msg = choice0.get("message") or {}
+            if "reasoning_content" not in msg:
+                msg["reasoning_content"] = reasoning
+            if "role" not in msg:
+                msg["role"] = "assistant"
+            choice0["message"] = msg
+            data["choices"][0] = choice0
+        except Exception:
+            pass
 
     SESSION.set(
         f"session:{cid}",
@@ -704,6 +796,7 @@ async def handle_stream(req: ChatCompletionRequest, rid: str, cid: str, client: 
     yield _sse_chunk(chunk_id, req.model, {"role": "assistant"})
 
     reasoning = ""
+    relay = ToolCallRelay()
     if THINK_ENABLED and ctx.task_type != TaskType.SIMPLE:
         try:
             reasoning = await got_reasoning(req, rid)
@@ -752,7 +845,14 @@ async def handle_stream(req: ChatCompletionRequest, rid: str, cid: str, client: 
             if "reasoning_content" in delta and delta["reasoning_content"] is not None:
                 out_delta["reasoning_content"] = delta["reasoning_content"]
             if "tool_calls" in delta and delta["tool_calls"] is not None:
-                out_delta["tool_calls"] = delta["tool_calls"]
+                mapped: List[Dict[str, Any]] = []
+                for tc in delta["tool_calls"]:
+                    if isinstance(tc, dict):
+                        built = relay.push(tc)
+                        if built is not None:
+                            mapped.append(built)
+                if mapped:
+                    out_delta["tool_calls"] = mapped
 
             if out_delta:
                 yield _sse_chunk(chunk_id, req.model, out_delta)
